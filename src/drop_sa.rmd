@@ -1,0 +1,164 @@
+---
+title: "drop_sa"
+output: html_document
+date: "2022-08-18"
+---
+
+```{r setup, include=FALSE}
+library(ComplexHeatmap)
+library(tidyverse)
+
+theme_set(theme_bw())
+
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r import_fraser}
+
+fraser_results_all.tib <- read_tsv(here::here("data", "trios_star_results.tsv.gz"))
+
+fraser_results.tib <- fraser_results_all.tib %>%
+    filter(padjust < 0.1) %>%
+    mutate(DROP_GROUP = case_when(str_detect(sampleID, "^DH") ~ "fraser,samples_bcchr",
+                                  str_detect(sampleID, "^(HG|NA)") ~ "fraser,controls_geuvadis",
+                                  str_detect(sampleID, "^GTEX") ~ "fraser,controls_gtex")) %>%
+    separate(DROP_GROUP, into = c("DROP_GROUP_RULE", "DROP_GROUP_ORIGIN"), sep = ",")
+
+fraser_results.tib %>%
+    # filter(hgncSymbol == "PHF21A")
+    filter(sampleID == "DH242401") %>%
+    arrange(padjust)
+
+```
+
+```{r plot_distribution_by_region, fig.height=8.6, fig.width=8.6}
+
+seqnames.order <-
+    c(paste0("chr", seq(1, 22)),
+      "chrX",
+      "chrM")
+
+# summarise junctions by sample ID and chromosome
+fraser_results_by_chrom.tib <-
+    fraser_results.tib %>%
+    filter(DROP_GROUP_ORIGIN == "samples_bcchr") %>%
+    group_by(sampleID, seqnames, type) %>%
+    tally() %>%
+    mutate(seqnames = factor(seqnames, levels = seqnames.order),
+           family_id = map_chr(sampleID,     ~ str_match(., "(DH[0-9]{4})([0-9]{2}|HC)")[2]),
+           individual_id = map_chr(sampleID, ~ str_match(., "(DH[0-9]{4})([0-9]{2}|HC)")[3]))
+
+ggplot(fraser_results_by_chrom.tib) +
+    geom_point(aes(x = seqnames, y = sampleID, size = n, color = type),
+               alpha = 0.5) +
+    facet_grid(rows = vars(family_id), scales = "free_y") +
+    theme(axis.text.x.bottom = element_text(angle = 45, hjust = 1))
+
+ggsave(here::here("plots", "fraser_results_by_chr_and_type.png"),
+       width = 8, height = 8)
+
+```
+
+## Quantify Gene Hit Frequency
+
+Want to count mutations by affected gene to identify hotspot genes with common splice defects in the population to select against them.
+
+```{r count_gene_hit_freq}
+
+fraser_results_by_gene.tib <-
+    fraser_results.tib %>%
+    group_by(DROP_GROUP_ORIGIN, hgncSymbol) %>%
+    tally() %>%
+    pivot_wider(names_from = DROP_GROUP_ORIGIN, values_from = n) %>%
+    mutate(across(-hgncSymbol, replace_na, 0)) %>%
+    arrange(desc(samples_bcchr))
+
+fraser_results_by_gene.tib
+
+```
+
+## Identify Unique Splice Defects in Patient Samples
+
+Will first try to look at distribution of hits and see if we can filter against everything that's observed in the population first.
+
+```{r filter_population_hits}
+
+fraser_sample_hits <-
+    fraser_results_by_gene.tib %>%
+    filter(controls_gtex <= 5)  # controls_geuvadis == 0, 
+
+fraser_sample_hits
+
+```
+
+This leaves 86 hits, will pull them out of the results to check significance and which individuals are affected. Will visualize as a heatmap.
+
+```{r extract_hits_from_sample_results, fig.width=8.6, fig.height=14}
+
+fraser_results_sample_hits_table <-
+    fraser_results.tib %>%
+    filter(DROP_GROUP_ORIGIN == "samples_bcchr",
+           hgncSymbol %in% fraser_sample_hits$hgncSymbol) %>%
+    dplyr::select(sampleID, hgncSymbol, padjust) %>%
+    # parse sample IDs into family and individual codes
+    mutate(family_id = map_chr(sampleID,     ~ str_match(., "(DH[0-9]{4})([0-9]{2}|HC)")[2]),
+           individual_id = map_chr(sampleID, ~ str_match(., "(DH[0-9]{4})([0-9]{2}|HC)")[3])) %>%
+    # mutate(log_padjust = -log(1 + padjust)) %>%
+    dplyr::select(-sampleID) %>%
+    pivot_wider(names_from = individual_id, values_from = padjust)
+
+plot_family_hits <- function(hit_table, this_family_id, proband_only = FALSE) {
+    hit_matrix <-
+        hit_table %>%
+        filter(family_id == this_family_id) %>%
+        { if (proband_only) filter(., !is.na(`01`),) else . } %>%
+        column_to_rownames("hgncSymbol") %>%
+        dplyr::select(sort(names(.)), -family_id) %>%
+        as.matrix() %>%
+        -log(.)
+    
+    ht <- Heatmap(hit_matrix,
+            name = paste0(this_family_id, ",\n-log(adj_p-val)"),
+            col = viridis::viridis(100),
+            cluster_columns = F,
+            cluster_rows = F,
+            na_col = "grey90",
+            width = ncol(hit_matrix) * unit(10, "mm"),
+            height = nrow(hit_matrix) * unit(10, "mm"),
+            rect_gp = gpar(col = "white", lwd = 4))
+    
+    ht.draw = draw(ht)
+    
+    png(file = here::here("plots", paste0(this_family_id, "_hit_summary.png")),
+        width = ComplexHeatmap:::width(ht.draw) %>%
+            convertX("inch", valueOnly = T),
+        height = ComplexHeatmap:::height(ht.draw) %>%
+            convertY("inch", valueOnly = T),
+        units = "in", res = 300)
+    
+    draw(ht)
+    
+    dev.off()
+}
+
+
+walk(unique(fraser_results_sample_hits_table$family_id),
+     ~ plot_family_hits(fraser_results_sample_hits_table, ., proband_only = T))
+
+```
+
+## Missing Hit Investigation
+
+It looks like true hits are being dropped because there are occurrences in the GTEx control. I want to determine what the average frequency of hits are within the GTEx dataset and see if a more reasonable threshold can be identified and used.
+
+### Determine hit distribution in GTEx
+
+```{r gtex_hit_distribution}
+
+ggplot(fraser_results_by_gene.tib %>%
+           pivot_longer(-hgncSymbol, names_to = "sample_group", values_to = "hit_count")) +
+    geom_histogram(aes(x = hit_count), bins = 21) +
+    xlim(c(0, 20)) +
+    facet_grid(rows = vars(sample_group))
+
+```
